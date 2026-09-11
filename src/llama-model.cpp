@@ -1726,7 +1726,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && ml.tp_pending_slices.empty()) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -3234,6 +3234,15 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_split(const char * src_name,
+        const std::initializer_list<int64_t> & ne_gpu,
+        const char * cpu_name, const std::initializer_list<int64_t> & ne_cpu,
+        int64_t row_split, int split_dim, int bid, ggml_tensor ** cpu_out) {
+    GGML_ASSERT(ml != nullptr);
+    const buft_list_t * buft_list_layer = bid == -1 ? nullptr : pimpl->dev_layer.at(bid).buft_list;
+    return ml->create_tensor_split(hparams, buft_list_layer, src_name, ne_gpu, cpu_name, ne_cpu, row_split, split_dim, cpu_out);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

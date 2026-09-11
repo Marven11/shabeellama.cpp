@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <time.h>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -799,6 +800,10 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// TP-FFN overlap: host->device async copy helper (destination backend), provided by
+// accelerator backends via ggml_backend_reg_get_proc_address("ggml_backend_cuda_cpy_host_async")
+typedef bool (* ggml_backend_sched_cpy_host_async_t)(ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst);
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -847,6 +852,21 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // TP-FFN overlap mode (GGML_SCHED_TP_OVERLAP=1): CPU splits skip the pre-split
+    // backend synchronization and host<->device split-input copies are issued on
+    // compute streams (stream order) instead of draining both backends with
+    // host-side synchronizations
+    bool tp_overlap;
+    // per-backend host->device async copy helper (destination backend)
+    ggml_backend_sched_cpy_host_async_t tp_cpy_host_async[GGML_SCHED_MAX_BACKENDS];
+    // diagnostic: print per-split timing in compute_splits (GGML_SCHED_SPLIT_TIMING=1)
+    bool split_timing;
+    // TP-FFN overlap: experimental - warm the next CPU split's weights into cache while
+    // waiting for the D2H copy (measured unstable on i7-13700HX: the single-threaded
+    // sweep often exceeds the wait window and pollutes L3, so this is off by default;
+    // enable with GGML_SCHED_TP_PREFETCH=1)
+    bool tp_prefetch = false;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -855,6 +875,46 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+// TP-FFN overlap: pull the weight tensors consumed by the next CPU split into the
+// cache. Called while blocking on the device->host copy that the current (staging)
+// CPU split waits on: at long context the wait spans the attention kernels of the
+// layer (hundreds of microseconds of otherwise idle host time), and the CPU compute
+// that follows in the next CPU split is bound by exactly these weights, so warming
+// them into L3 during the wait shortens the critical path. Reads at cache-line
+// granularity; the sum is kept alive to prevent the compiler from folding the loads.
+static void ggml_backend_sched_tp_prefetch_weights(const struct ggml_backend_sched * sched, int from_split) {
+    const int cpu_backend_id = sched->n_backends - 1;
+    for (int i = from_split; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        if (split->backend_id != cpu_backend_id) {
+            continue;
+        }
+        // the first CPU split after `from_split` is the one whose compute runs right
+        // after this wait completes; stop after warming it
+        uint64_t sink = 0;
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            const ggml_tensor * node = split->graph.nodes[j];
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * t = node ? node->src[s] : NULL;
+                if (!t || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                    continue;
+                }
+                // only large tensors: model weights are MiB-scale, activations are KiB-scale
+                const size_t nbytes = ggml_nbytes(t);
+                if (nbytes < 128*1024) {
+                    continue;
+                }
+                const volatile uint8_t * p = (const volatile uint8_t *) t->data;
+                for (size_t i = 0; i < nbytes; i += 64) {
+                    sink += p[i];
+                }
+            }
+        }
+        __asm__ volatile("" : : "r"(sink) : "memory");
+        return;
+    }
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1690,6 +1750,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // diagnostic split timing (GGML_SCHED_SPLIT_TIMING=1)
+    static bool timing_on = false;
+    static double timing_prev = 0;
+    if (sched->split_timing && !timing_on) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        timing_prev = ts.tv_sec + 1e-9*ts.tv_nsec;
+        timing_on = true;
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1702,8 +1771,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // this split, the allocator may have reused buffer regions across splits.
+        // exception: CPU-backend splits do not need this wait. CPU graph compute is
+        // host-synchronous, and tensors in the CPU graph buffer are only ever consumed
+        // by other backends through synchronous copies (no async reads), so skipping
+        // the wait is safe and lets the CPU split overlap pending GPU work
+        // (required by TP-FFN; gated by GGML_SCHED_TP_OVERLAP)
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+                !(sched->tp_overlap && split_backend_id == sched->n_backends - 1)) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1726,6 +1801,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // TP-FFN overlap: host <-> device copies are issued on a compute stream and
+                // rely on stream ordering instead of draining both backends with host syncs
+                // (gated by GGML_SCHED_TP_OVERLAP; the upstream fallback below stays unchanged)
+                if (sched->tp_overlap) {
+                    const bool input_on_host = ggml_backend_buffer_is_host(input->buffer);
+                    const bool cpy_on_host   = ggml_backend_buffer_is_host(input_cpy->buffer);
+                    if (!input_on_host && cpy_on_host && input_backend->iface.get_tensor_async != NULL) {
+                        // device -> host: issue the copy on the producer's compute stream, so it
+                        // is ordered after the producer of `input` in stream order, then wait for
+                        // that stream. The destination host memory is only read afterwards by the
+                        // host-synchronous compute of this CPU split, and any previous CPU user of
+                        // that buffer region has already completed (CPU compute is host-synchronous)
+                        ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                        if (sched->tp_prefetch) {
+                            ggml_backend_sched_tp_prefetch_weights(sched, split_id + 1);
+                        }
+                        ggml_backend_synchronize(input_backend);
+                        if (timing_on) {
+                            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                            double now = ts.tv_sec + 1e-9*ts.tv_nsec;
+                            fprintf(stderr, "[SPLITT]   d2hwait=%.3f ms\n", (now - timing_prev)*1e3);
+                            timing_prev = now;
+                        }
+                        continue;
+                    }
+                    if (input_on_host && !cpy_on_host && sched->tp_cpy_host_async[split_backend_id] != NULL) {
+                        // host -> device: issue the copy on the destination compute stream; kernels
+                        // submitted later on the same stream (this split's compute) observe it in
+                        // stream order, and previously submitted kernels using the destination
+                        // buffer region are ordered before it, so no host-side wait is needed
+                        if (sched->tp_cpy_host_async[split_backend_id](split_backend, input, input_cpy)) {
+                            continue;
+                        }
+                    }
+                }
+
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1836,9 +1947,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            double compute_t0 = 0;
+            if (timing_on) {
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                compute_t0 = ts.tv_sec + 1e-9*ts.tv_nsec;
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (timing_on) {
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                double now = ts.tv_sec + 1e-9*ts.tv_nsec;
+                fprintf(stderr, "[SPLITT] %3d/%3d %-6s nodes=%4d ninp=%d head=%.3f compute=%.3f\n",
+                        split_id, sched->n_splits, ggml_backend_name(split_backend),
+                        split->graph.n_nodes, split->n_inputs,
+                        (compute_t0 - timing_prev)*1e3, (now - compute_t0)*1e3);
+                timing_prev = now;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1910,8 +2035,24 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
+    // TP-FFN overlap mode (see compute_splits): skip the conservative pre-CPU-split sync
+    // and issue host<->device split-input copies on compute streams
+    const char * GGML_SCHED_TP_OVERLAP = getenv("GGML_SCHED_TP_OVERLAP");
+    sched->tp_overlap = GGML_SCHED_TP_OVERLAP && atoi(GGML_SCHED_TP_OVERLAP) != 0;
+    const char * GGML_SCHED_TP_PREFETCH = getenv("GGML_SCHED_TP_PREFETCH");
+    sched->tp_prefetch = GGML_SCHED_TP_PREFETCH ? atoi(GGML_SCHED_TP_PREFETCH) != 0 : false;
+    const char * GGML_SCHED_SPLIT_TIMING = getenv("GGML_SCHED_SPLIT_TIMING");
+    sched->split_timing = GGML_SCHED_SPLIT_TIMING && atoi(GGML_SCHED_SPLIT_TIMING) != 0;
+
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+
+    if (sched->tp_overlap) {
+        for (int b = 0; b < n_backends; b++) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[b]));
+            sched->tp_cpy_host_async[b] = (ggml_backend_sched_cpy_host_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_cpy_host_async");
+        }
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

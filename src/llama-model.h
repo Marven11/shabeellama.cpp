@@ -318,6 +318,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate     = nullptr; // w1
     struct ggml_tensor * ffn_down     = nullptr; // w2
     struct ggml_tensor * ffn_up       = nullptr; // w3
+    // TP-FFN: neuron-dim slice of the FFN computed on the CPU backend;
+    // neurons [n_ff_gpu, n_ff) of gate/up/down live on CPU, the rest on GPU
+    struct ggml_tensor * ffn_gate_cpu = nullptr; // w1 CPU part
+    struct ggml_tensor * ffn_down_cpu = nullptr; // w2 CPU part
+    struct ggml_tensor * ffn_up_cpu   = nullptr; // w3 CPU part
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
@@ -783,6 +788,14 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // TP-FFN: convenience wrapper for llama_model_loader::create_tensor_split;
+    // bid is the layer id used to select the buffer type list; the CPU part tensor
+    // is returned via *cpu_out, the GPU part is the return value
+    ggml_tensor * create_tensor_split(const char * src_name,
+            const std::initializer_list<int64_t> & ne_gpu,
+            const char * cpu_name, const std::initializer_list<int64_t> & ne_cpu,
+            int64_t row_split, int split_dim, int bid, ggml_tensor ** cpu_out);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

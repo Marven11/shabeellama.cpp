@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstring>
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -40,6 +42,45 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+
+    // TP-FFN: number of FFN neurons (rows) per layer computed on the CPU.
+    // Quantized rows are aligned to 256 elements, so the split offset is 256-aligned.
+    int64_t n_ff_cpu_tp = 0;
+    if (const char * env = getenv("BEELLAMA_FFN_TP_CPU")) {
+        n_ff_cpu_tp = atoll(env);
+        n_ff_cpu_tp = (n_ff_cpu_tp / 256) * 256;
+        if (n_ff_cpu_tp < 0) {
+            n_ff_cpu_tp = 0;
+        }
+        if (n_ff_cpu_tp >= hparams.n_ff()) {
+            n_ff_cpu_tp = 0; // a full layer is not a split; use --n-cpu-ffn instead
+        }
+        if (n_ff_cpu_tp > 0) {
+            LLAMA_LOG_INFO("%s: TP-FFN enabled, %lld of %lld FFN neurons per layer on CPU\n",
+                    __func__, (long long) n_ff_cpu_tp, (long long) hparams.n_ff());
+        }
+    }
+
+    // TP-FFN: apply the neuron split only to the first K layers (default: all trunk layers)
+    int64_t n_ff_cpu_tp_layers = (int64_t) hparams.n_layer();
+    if (const char * env = getenv("BEELLAMA_FFN_TP_LAYERS")) {
+        n_ff_cpu_tp_layers = atoll(env);
+        if (n_ff_cpu_tp_layers < 0) {
+            n_ff_cpu_tp_layers = 0;
+        }
+        if (n_ff_cpu_tp_layers > (int64_t) hparams.n_layer()) {
+            n_ff_cpu_tp_layers = (int64_t) hparams.n_layer();
+        }
+    }
+
+    // TP-FFN: place the CPU work only on full-attention layers (BEELLAMA_FFN_TP_WHERE=attn).
+    // The attention layers have by far the longest GPU time at long context, so the CPU
+    // split work there overlaps with running GPU work and the GPU stream stays busy;
+    // GDN/recurrent layers are GPU-cheap and would go CPU-bound if split.
+    bool tp_only_attn = false;
+    if (const char * env = getenv("BEELLAMA_FFN_TP_WHERE")) {
+        tp_only_attn = strcmp(env, "attn") == 0;
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -89,9 +130,27 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+        if (n_ff_cpu_tp > 0 && trunk_flags == 0 && il < n_ff_cpu_tp_layers &&
+                (!tp_only_attn || !hparams.is_recr(il))) {
+            // TP-FFN: neuron-dim split; neurons [n_ff_gpu, n_ff) live on CPU.
+            // The GPU parts of gate/up keep the original file names (load_all_data loads
+            // rows [0, n_ff_gpu) automatically); the down parts are both custom-named
+            // slices filled after the main load loop.
+            const int64_t n_ff_g = hparams.n_ff() - n_ff_cpu_tp;
+            const std::string sn_gate = tn(LLM_TENSOR_FFN_GATE, "weight", il).str();
+            const std::string sn_down = tn(LLM_TENSOR_FFN_DOWN, "weight", il).str();
+            const std::string sn_up   = tn(LLM_TENSOR_FFN_UP,   "weight", il).str();
+            layer.ffn_gate = create_tensor_split(sn_gate.c_str(), {n_embd, n_ff_g},
+                    (sn_gate + ".tp_cpu").c_str(), {n_embd, n_ff_cpu_tp}, n_ff_g, 1, il, &layer.ffn_gate_cpu);
+            layer.ffn_down = create_tensor_split(sn_down.c_str(), {n_ff_g, n_embd},
+                    (sn_down + ".tp_cpu").c_str(), {n_ff_cpu_tp, n_embd}, n_ff_g, 0, il, &layer.ffn_down_cpu);
+            layer.ffn_up   = create_tensor_split(sn_up.c_str(), {n_embd, n_ff_g},
+                    (sn_up + ".tp_cpu").c_str(), {n_embd, n_ff_cpu_tp}, n_ff_g, 1, il, &layer.ffn_up_cpu);
+        } else {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+        }
     };
 
     auto load_block_mtp = [&](int il) {
@@ -474,10 +533,60 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
 
+    auto & layer = model.layers[il];
+
+    if (layer.ffn_down_cpu) {
+        // TP-FFN: neuron-dim split.
+        //
+        // Overlap structure (no scheduler changes needed):
+        //  - cur_cpu_in is a real op (ggml_scale) assigned to the CPU backend, so the CPU
+        //    branch is a split of its own whose only cross-backend input is `cur`. The
+        //    scheduler performs that copy synchronously right after the GPU attention
+        //    split was submitted - while the GPU is still busy with attention.
+        //  - split order per layer becomes [GPU: attn][CPU: scale][GPU: ffn_gpu][CPU: ffn_cpu][GPU: add],
+        //    so ffn_gpu is already queued and running while the host computes ffn_cpu:
+        //    the two branches really overlap and the cost is max(gpu, cpu), not sum.
+        ggml_tensor * cur_cpu_in = ggml_scale(ctx0, cur, 1.0f);
+        if (sched && backend_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, cur_cpu_in, backend_cpu);
+        }
+        cb(cur_cpu_in, "ffn_tp_cpu_in", il);
+        // NOTE: the graph node order is decided by the final forward DFS, not by the
+        // creation order: the DFS expands the add's src[0] (ffn_gpu) chain before
+        // src[1] (ffn_cpu), which would place the CPU staging node AFTER the GPU FFN
+        // and make the scheduler's copy of `cur` block until ffn_gpu finished (serial).
+        // Expand the staging node right here so it lands between attention and ffn_gpu:
+        // [GPU: attn][CPU: scale][GPU: ffn_gpu][CPU: ffn_cpu][GPU: add].
+        if (gf) {
+            ggml_build_forward_expand(gf, cur_cpu_in);
+        }
+
+        ggml_tensor * cur_gpu = build_ffn(cur,
+            layer.ffn_up, NULL, layer.ffn_up_s,
+            layer.ffn_gate, NULL, layer.ffn_gate_s,
+            layer.ffn_down, NULL, layer.ffn_down_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur_gpu, "ffn_out_tp_gpu", il);
+
+        ggml_tensor * cur_cpu = build_ffn(cur_cpu_in,
+            layer.ffn_up_cpu, NULL, layer.ffn_up_s,
+            layer.ffn_gate_cpu, NULL, layer.ffn_gate_s,
+            layer.ffn_down_cpu, NULL, layer.ffn_down_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur_cpu, "ffn_out_tp_cpu", il);
+
+        cur = ggml_add(ctx0, cur_gpu, cur_cpu);
+        cb(cur, "ffn_out", il);
+
+        return cur;
+    }
+
     cur = build_ffn(cur,
-        model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
-        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+        layer.ffn_up, NULL, layer.ffn_up_s,
+        layer.ffn_gate, NULL, layer.ffn_gate_s,
+        layer.ffn_down, NULL, layer.ffn_down_s,
         NULL,
         LLM_FFN_SILU, LLM_FFN_PAR, il);
     cb(cur, "ffn_out", il);

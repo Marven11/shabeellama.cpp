@@ -121,6 +121,21 @@ struct llama_model_loader {
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // TP-FFN: neuron-dim slices waiting to be filled after the main data load.
+    // A slice is a row range of a file tensor (gate/up: whole rows along ne[1];
+    // down: an element range inside each row along ne[0]).
+    struct tp_pending_slice {
+        struct ggml_tensor * t;   // slice tensor to fill
+        std::string src_name;     // file tensor the slice is cut from
+        int64_t row_off;          // first row (split_dim=1) or element (split_dim=0) of the slice
+        int64_t split_dim;        // 1: gate/up (row slice), 0: down (in-row slice)
+        bool     is_gpu;          // true: slice is the GPU part (custom name, not auto-loaded)
+    };
+    std::vector<tp_pending_slice> tp_pending_slices;
+
+    // TP-FFN: extra tensors created beyond the file tensor count (CPU slices)
+    int n_created_extra = 0;
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;
@@ -194,6 +209,20 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // TP-FFN: cut a neuron-dim slice of the file tensor `src_name` into a GPU part and a CPU part.
+    // split_dim == 1 (gate/up, ne = {n_embd, n_ff}): the GPU part keeps the file name so that
+    //   load_all_data() loads rows [0, row_split) automatically; the CPU part (rows [row_split, ne[1]))
+    //   is registered as a pending slice. Returns the GPU part, *cpu_out receives the CPU part.
+    // split_dim == 0 (down, ne = {n_ff, n_embd}): the neuron dim is ne[0] (the fastest dim); neither
+    //   part is a contiguous prefix, so both parts get custom names and are registered as pending
+    //   slices filled after the main load loop.
+    struct ggml_tensor * create_tensor_split(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const char * src_name,
+        const std::initializer_list<int64_t> & ne_gpu,
+        const char * cpu_name, const std::initializer_list<int64_t> & ne_cpu,
+        int64_t row_split, int split_dim, struct ggml_tensor ** cpu_out);
 
     void done_getting_tensors(bool partial = false) const;
 

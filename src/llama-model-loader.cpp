@@ -1079,6 +1079,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            max_n_tensors += 512 + hparams.n_layer()*8; // TP-FFN split tensors + headroom
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1343,8 +1344,101 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+struct ggml_tensor * llama_model_loader::create_tensor_split(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const char * src_name,
+        const std::initializer_list<int64_t> & ne_gpu,
+        const char * cpu_name, const std::initializer_list<int64_t> & ne_cpu,
+        int64_t row_split, int split_dim, struct ggml_tensor ** cpu_out) {
+    struct ggml_tensor * t_src = get_tensor_meta(src_name);
+    GGML_ASSERT(t_src != nullptr);
+    GGML_ASSERT(split_dim == 0 || split_dim == 1);
+    GGML_ASSERT(row_split > 0 && row_split < t_src->ne[split_dim]);
+
+    auto make_meta = [&](ggml_tensor & t, std::initializer_list<int64_t> ne) {
+        memset(&t, 0, sizeof(t));
+        t.type = t_src->type;
+        for (size_t d = 0; d < GGML_MAX_DIMS; d++) {
+            t.ne[d] = d < ne.size() ? ne.begin()[d] : 1;
+            GGML_ASSERT(t.ne[d] >= 1);
+            if (d == 0) {
+                t.nb[0] = ggml_type_size(t.type);
+            } else if (d == 1) {
+                t.nb[1] = ggml_row_size(t.type, t.ne[0]);
+            } else {
+                t.nb[d] = t.nb[d-1]*t.ne[d-1];
+            }
+            GGML_ASSERT(t.nb[d] >= 1);
+        }
+    };
+
+    // same per-buft context bookkeeping as create_tensor, with headroom for the slice tensors
+    auto ctx_for_buft_impl = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            int max_n_tensors = n_tensors + 512 + hparams.n_layer()*8;
+            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+            ggml_init_params params = {
+                /*.mem_size   =*/ ctx_size,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context");
+            }
+            ctx_map.emplace(buft, ctx);
+            return ctx;
+        }
+        return it->second.get();
+    };
+
+    // GPU part
+    ggml_tensor t_gpu_meta;
+    make_meta(t_gpu_meta, ne_gpu);
+    ggml_backend_buffer_type_t buft_gpu = select_weight_buft(hparams, &t_gpu_meta, GGML_OP_MUL_MAT, buft_list_layer);
+    if (!buft_gpu) {
+        throw std::runtime_error(format("create_tensor_split: failed to find a compatible buffer type for %s", src_name));
+    }
+    ggml_context * ctx_gpu = ctx_for_buft_impl(buft_gpu);
+    struct ggml_tensor * t_gpu = ggml_dup_tensor(ctx_gpu, &t_gpu_meta);
+
+    // CPU part: always on the plain CPU backend so the CPU backend computes it
+    ggml_tensor t_cpu_meta;
+    make_meta(t_cpu_meta, ne_cpu);
+    ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
+    ggml_context * ctx_cpu = ctx_for_buft_impl(buft_cpu);
+    struct ggml_tensor * t_cpu = ggml_dup_tensor(ctx_cpu, &t_cpu_meta);
+    ggml_set_name(t_cpu, cpu_name);
+
+    if (split_dim == 1) {
+        // gate/up: the GPU part is a contiguous row prefix of the source tensor;
+        // keeping the file name lets load_all_data() load it automatically
+        ggml_set_name(t_gpu, src_name);
+        tp_pending_slices.push_back({ t_cpu, std::string(src_name), row_split, split_dim, false });
+    } else {
+        // down: the neuron dim is the fastest dim; neither part is a contiguous prefix,
+        // both parts get custom names and are filled by the pending-slice loader
+        const std::string gpu_name = std::string(src_name) + ".tp_gpu";
+        ggml_set_name(t_gpu, gpu_name.c_str());
+        tp_pending_slices.push_back({ t_gpu, std::string(src_name), 0,      split_dim, true  });
+        tp_pending_slices.push_back({ t_cpu, std::string(src_name), row_split, split_dim, false });
+    }
+    *cpu_out = t_cpu;
+
+    // the GPU part consumes the file tensor's creation slot; the CPU part is extra
+    n_created++;
+    n_created_extra++;
+
+    LLAMA_LOG_INFO("%s: %s split dim %d at %lld -> GPU %s + CPU %s (%s, %.2f MiB CPU part)\n",
+            __func__, src_name, split_dim, (long long) row_split, ggml_get_name(t_gpu),
+            cpu_name, ggml_type_name(t_cpu->type), ggml_nbytes(t_cpu)/1024.0/1024.0);
+
+    return t_gpu;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
+    if (n_created > n_tensors + n_created_extra) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
     if (n_created < n_tensors) {
@@ -1414,6 +1508,38 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         }
         *first = std::min(*first, weight->offs);
         *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+    }
+
+    // TP-FFN: slices in this ctx read from their source tensor's rows; extend the mapped range
+    for (const auto & ps : tp_pending_slices) {
+        if (ggml_get_tensor(ctx, ggml_get_name(ps.t)) != ps.t) {
+            continue;
+        }
+        const auto * weight = get_weight(ps.src_name.c_str());
+        if (!weight || weight->idx != idx) {
+            continue;
+        }
+        struct ggml_tensor * t_src_meta = get_tensor_meta(ps.src_name.c_str());
+        if (!t_src_meta) {
+            continue;
+        }
+        const size_t row_bytes = ggml_row_size(ps.t->type, ps.t->ne[0]);
+        if (ps.split_dim == 1) {
+            // gate/up: the slice is a contiguous range of whole rows
+            const size_t off_b = weight->offs + (size_t) ps.row_off * row_bytes;
+            *first = std::min(*first, off_b);
+            *last  = std::max(*last,  off_b + ggml_nbytes(ps.t));
+        } else {
+            // down: the neuron dim is the fastest dim; the slice covers an element range
+            // inside every row, so it spans the whole row block of the source tensor
+            const size_t blk   = ggml_blck_size(ps.t->type);
+            const size_t esize = ggml_type_size(ps.t->type);
+            GGML_ASSERT(ps.row_off % blk == 0);
+            const size_t off_b = weight->offs + (size_t) ps.row_off / blk * esize;
+            const size_t src_row_bytes = ggml_row_size(ps.t->type, t_src_meta->ne[0]);
+            *first = std::min(*first, off_b);
+            *last  = std::max(*last,  weight->offs + (size_t) t_src_meta->ne[1] * src_row_bytes);
+        }
     }
 }
 
@@ -1680,6 +1806,84 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    // TP-FFN: fill the registered neuron-dim slices from their source tensors
+    if (!tp_pending_slices.empty()) {
+        std::vector<uint8_t> tp_stage;
+        for (const auto & ps : tp_pending_slices) {
+            const auto & w = require_weight(ps.src_name.c_str());
+            struct ggml_tensor * t_src = get_tensor_meta(ps.src_name.c_str());
+            GGML_ASSERT(t_src != nullptr);
+            const size_t nbytes = ggml_nbytes(ps.t);
+            if (use_mmap) {
+                const auto & mapping = mappings.at(w.idx);
+                uint8_t * base = (uint8_t *) mapping->addr() + w.offs;
+                if (ps.split_dim == 1) {
+                    const size_t row_bytes = ggml_row_size(ps.t->type, ps.t->ne[0]);
+                    uint8_t * data = base + (size_t) ps.row_off * row_bytes;
+                    GGML_ASSERT(ps.t->data != nullptr);
+                    if (ggml_backend_buffer_is_host(ps.t->buffer)) {
+                        memcpy(ps.t->data, data, nbytes);
+                    } else {
+                        ggml_backend_tensor_set(ps.t, data, 0, nbytes);
+                    }
+                } else {
+                    // split_dim == 0: the neuron dim is the fastest dim; both parts are strided copies
+                    // (row r of the part = elements [row_off, row_off + part_ne0) of source row r)
+                    const size_t src_row_bytes = ggml_row_size(ps.t->type, t_src->ne[0]);
+                    const size_t dst_row_bytes = ggml_row_size(ps.t->type, ps.t->ne[0]);
+                    const size_t blk   = ggml_blck_size(ps.t->type);
+                    const size_t esize = ggml_type_size(ps.t->type);
+                    const size_t off_in_row = (size_t) ps.row_off / blk * esize;
+                    GGML_ASSERT(ps.row_off % blk == 0);
+                    GGML_ASSERT(dst_row_bytes == (size_t) ps.t->ne[0] / blk * esize);
+                    GGML_ASSERT(ps.t->data != nullptr);
+                    if (ggml_backend_buffer_is_host(ps.t->buffer)) {
+                        for (int64_t r = 0; r < ps.t->ne[1]; r++) {
+                            memcpy((uint8_t *) ps.t->data + r*dst_row_bytes, base + r*src_row_bytes + off_in_row, dst_row_bytes);
+                        }
+                    } else {
+                        tp_stage.resize(nbytes);
+                        for (int64_t r = 0; r < ps.t->ne[1]; r++) {
+                            memcpy(tp_stage.data() + r*dst_row_bytes, base + r*src_row_bytes + off_in_row, dst_row_bytes);
+                        }
+                        ggml_backend_tensor_set(ps.t, tp_stage.data(), 0, nbytes);
+                    }
+                }
+            } else {
+                const auto & file = files.at(w.idx);
+                const size_t src_row_bytes = ggml_row_size(ps.t->type, t_src->ne[0]);
+                const size_t dst_row_bytes = ggml_row_size(ps.t->type, ps.t->ne[0]);
+                const size_t blk   = ggml_blck_size(ps.t->type);
+                const size_t esize = ggml_type_size(ps.t->type);
+                const size_t off_in_row = (size_t) ps.row_off / blk * esize;
+                GGML_ASSERT(ps.row_off % blk == 0);
+                if (ps.split_dim == 1) {
+                    const size_t off_b = (size_t) ps.row_off * src_row_bytes;
+                    if (ggml_backend_buffer_is_host(ps.t->buffer)) {
+                        file->seek(w.offs + off_b, SEEK_SET);
+                        file->read_raw(ps.t->data, nbytes);
+                    } else {
+                        read_buf.resize(nbytes);
+                        file->seek(w.offs + off_b, SEEK_SET);
+                        file->read_raw(read_buf.data(), nbytes);
+                        ggml_backend_tensor_set(ps.t, read_buf.data(), 0, nbytes);
+                    }
+                } else {
+                    std::vector<uint8_t> stage(nbytes);
+                    for (int64_t r = 0; r < ps.t->ne[1]; r++) {
+                        file->seek(w.offs + (size_t) r*src_row_bytes + off_in_row, SEEK_SET);
+                        file->read_raw(stage.data() + r*dst_row_bytes, dst_row_bytes);
+                    }
+                    if (ggml_backend_buffer_is_host(ps.t->buffer)) {
+                        memcpy(ps.t->data, stage.data(), nbytes);
+                    } else {
+                        ggml_backend_tensor_set(ps.t, stage.data(), 0, nbytes);
+                    }
+                }
+            }
+        }
     }
 
     // free temporary resources used for async uploads

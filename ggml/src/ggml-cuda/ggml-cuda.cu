@@ -2583,6 +2583,38 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// TP-FFN overlap: host -> device copy issued on the destination compute stream.
+// The source tensor lives in a host buffer (e.g. the scheduler's CPU graph buffer);
+// its contents are stable because CPU graph compute is host-synchronous. The copy
+// is ordered after all previously submitted work on that stream (including any
+// prior kernel that used the destination buffer region, also across graph
+// resubmissions), and kernels submitted later on the same stream observe it in
+// stream order, so the caller does not need any host-side synchronization.
+GGML_API bool ggml_backend_cuda_cpy_host_async(ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    if (!ggml_backend_buffer_is_host(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend_dst->context;
+    ggml_backend_cuda_buffer_context * buf_ctx = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+
+    if (cuda_ctx->device != buf_ctx->device) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx->stream()));
+
+    return true;
+}
+
 #ifndef NDEBUG
 static const ggml_tensor * ggml_cuda_kvarn_view_base(const ggml_tensor * t) {
     while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
@@ -5803,6 +5835,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_cpy_host_async") == 0) {
+        return (void *)ggml_backend_cuda_cpy_host_async;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
