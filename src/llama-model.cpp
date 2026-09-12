@@ -2641,6 +2641,30 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    // Bee: optional sliding-window KV for the MTP draft head.
+                    // The draft layer only applies a local attention correction on
+                    // top of the trunk hidden state, so its KV can be kept as a
+                    // ring of the last W positions (BEELLAMA_MTP_DRAFT_KV_W).
+                    // Drafts are always verified by the target model, so this can
+                    // only affect acceptance rate, never output correctness.
+                    uint32_t       kv_size_cur  = cparams.n_ctx_seq;
+                    uint32_t       n_swa_cur    = hparams.n_swa;
+                    llama_swa_type swa_type_cur = hparams.swa_type;
+                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
+                        const char * wenv = getenv("BEELLAMA_MTP_DRAFT_KV_W");
+                        if (wenv && *wenv) {
+                            const uint32_t w = std::max((uint32_t) 256,
+                                    (uint32_t) strtoul(wenv, nullptr, 10));
+                            if (w > 0) {
+                                kv_size_cur  = GGML_PAD(w + cparams.n_ubatch, 256);
+                                n_swa_cur    = w;
+                                swa_type_cur = LLAMA_SWA_TYPE_STANDARD;
+                                LLAMA_LOG_INFO("%s: Bee MTP draft KV windowed: n_swa = %u, kv_size = %u (was %u)\n",
+                                        __func__, w, kv_size_cur, cparams.n_ctx_seq);
+                            }
+                        }
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2740,11 +2764,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     !cparams.flash_attn,
                                     cparams.offload_kqv,
                                     cparams.kv_unified,
-                                    cparams.n_ctx_seq,
+                                    kv_size_cur,
                                     cparams.n_seq_max,
                                     1,
-                                    hparams.n_swa,
-                                    hparams.swa_type,
+                                    n_swa_cur,
+                                    swa_type_cur,
                                     nullptr,
                                     filter,
                                     nullptr,
