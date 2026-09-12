@@ -2775,6 +2775,17 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+#if defined(__AVX2__)
+// Bee: gather 4 consecutive 8-byte grid entries via two dword-plane vgathers.
+// idx4 = 4 table-entry indices; result = 4 entries as 8-byte qwords (same layout as set_epi64x).
+static inline __m256i ggml_bee_gather_4x8b(const void * table, const __m128i idx4) {
+    const __m128i d = _mm_slli_epi32(idx4, 1);
+    const __m128i e = _mm_i32gather_epi32((const int *)table, d, 4);
+    const __m128i o = _mm_i32gather_epi32((const int *)table, _mm_add_epi32(d, _mm_set1_epi32(1)), 4);
+    return _mm256_set_m128i(_mm_unpackhi_epi32(e, o), _mm_unpacklo_epi32(e, o));
+}
+#endif
+
 void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -2853,14 +2864,29 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8_4 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
 
-            const __m256i q2_1 = _mm256_set_epi64x(iq2xs_grid[gindex[ 3]], iq2xs_grid[gindex[ 2]],
-                                                   iq2xs_grid[gindex[ 1]], iq2xs_grid[gindex[ 0]]);
-            const __m256i q2_2 = _mm256_set_epi64x(iq2xs_grid[gindex[ 7]], iq2xs_grid[gindex[ 6]],
-                                                   iq2xs_grid[gindex[ 5]], iq2xs_grid[gindex[ 4]]);
-            const __m256i q2_3 = _mm256_set_epi64x(iq2xs_grid[gindex[11]], iq2xs_grid[gindex[10]],
-                                                   iq2xs_grid[gindex[ 9]], iq2xs_grid[gindex[ 8]]);
-            const __m256i q2_4 = _mm256_set_epi64x(iq2xs_grid[gindex[15]], iq2xs_grid[gindex[14]],
-                                                   iq2xs_grid[gindex[13]], iq2xs_grid[gindex[12]]);
+            // Bee: env-gated vgather fast path (bit-exact; Raptor Lake where scalar LUT gathers bite)
+            static int fast_gather = -1;
+            if (fast_gather < 0) {
+                fast_gather = getenv("BEELLAMA_CPU_FAST_IQ") != NULL;
+            }
+            __m256i q2_1, q2_2, q2_3, q2_4;
+            if (fast_gather) {
+                const __m256i il = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(aux_gindex));
+                const __m256i ih = _mm256_cvtepu16_epi32(_mm256_extractf128_si256(aux_gindex, 1));
+                q2_1 = ggml_bee_gather_4x8b(iq2xs_grid, _mm256_castsi256_si128(il));
+                q2_2 = ggml_bee_gather_4x8b(iq2xs_grid, _mm256_extractf128_si256(il, 1));
+                q2_3 = ggml_bee_gather_4x8b(iq2xs_grid, _mm256_castsi256_si128(ih));
+                q2_4 = ggml_bee_gather_4x8b(iq2xs_grid, _mm256_extractf128_si256(ih, 1));
+            } else {
+                q2_1 = _mm256_set_epi64x(iq2xs_grid[gindex[ 3]], iq2xs_grid[gindex[ 2]],
+                                         iq2xs_grid[gindex[ 1]], iq2xs_grid[gindex[ 0]]);
+                q2_2 = _mm256_set_epi64x(iq2xs_grid[gindex[ 7]], iq2xs_grid[gindex[ 6]],
+                                         iq2xs_grid[gindex[ 5]], iq2xs_grid[gindex[ 4]]);
+                q2_3 = _mm256_set_epi64x(iq2xs_grid[gindex[11]], iq2xs_grid[gindex[10]],
+                                         iq2xs_grid[gindex[ 9]], iq2xs_grid[gindex[ 8]]);
+                q2_4 = _mm256_set_epi64x(iq2xs_grid[gindex[15]], iq2xs_grid[gindex[14]],
+                                         iq2xs_grid[gindex[13]], iq2xs_grid[gindex[12]]);
+            }
 
             const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
             const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
@@ -3287,17 +3313,42 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-            const __m256i q2_1 = _mm256_set_epi32(iq3xxs_grid[q3[7]], iq3xxs_grid[q3[6]], iq3xxs_grid[q3[5]], iq3xxs_grid[q3[4]],
-                                                  iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
-            q3 += 8;
-            const __m256i q2_2 = _mm256_set_epi32(iq3xxs_grid[q3[7]], iq3xxs_grid[q3[6]], iq3xxs_grid[q3[5]], iq3xxs_grid[q3[4]],
-                                                  iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
-            q3 += 8;
-            memcpy(aux32, gas, 8); gas += 8;
-            const __m256i s2_1 = _mm256_set_epi64x(signs64[(aux32[0] >> 21) & 127], signs64[(aux32[0] >> 14) & 127],
-                                                   signs64[(aux32[0] >>  7) & 127], signs64[(aux32[0] >>  0) & 127]);
-            const __m256i s2_2 = _mm256_set_epi64x(signs64[(aux32[1] >> 21) & 127], signs64[(aux32[1] >> 14) & 127],
-                                                   signs64[(aux32[1] >>  7) & 127], signs64[(aux32[1] >>  0) & 127]);
+            // Bee: env-gated vgather fast path (bit-exact; ~1.5x on Raptor Lake where the scalar
+            // set_epi32 LUT gathers are the bottleneck). Tradeoff is CPU-specific, hence the gate.
+            static int fast_gather = -1;
+            if (fast_gather < 0) {
+                fast_gather = getenv("BEELLAMA_CPU_FAST_IQ") != NULL;
+            }
+            memcpy(aux32, gas, 8);
+            __m256i q2_1, q2_2, s2_1, s2_2;
+            if (fast_gather) {
+                const __m256i gidx1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)q3));
+                q2_1 = _mm256_i32gather_epi32((const int *)iq3xxs_grid, gidx1, 4);
+                const __m256i gidx2 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(q3 + 8)));
+                q2_2 = _mm256_i32gather_epi32((const int *)iq3xxs_grid, gidx2, 4);
+                const __m128i shuft = _mm_setr_epi32(0, 7, 14, 21);
+                const __m128i m127  = _mm_set1_epi32(127);
+                const __m128i sidx0 = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(aux32[0]), shuft), m127);
+                const __m128i sidx1 = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(aux32[1]), shuft), m127);
+                const __m128i d0 = _mm_slli_epi32(sidx0, 1);
+                const __m128i d1 = _mm_slli_epi32(sidx1, 1);
+                const __m128i e0 = _mm_i32gather_epi32((const int *)signs64, d0, 4);
+                const __m128i o0 = _mm_i32gather_epi32((const int *)signs64, _mm_add_epi32(d0, _mm_set1_epi32(1)), 4);
+                const __m128i e1 = _mm_i32gather_epi32((const int *)signs64, d1, 4);
+                const __m128i o1 = _mm_i32gather_epi32((const int *)signs64, _mm_add_epi32(d1, _mm_set1_epi32(1)), 4);
+                s2_1 = _mm256_set_m128i(_mm_unpackhi_epi32(e0, o0), _mm_unpacklo_epi32(e0, o0));
+                s2_2 = _mm256_set_m128i(_mm_unpackhi_epi32(e1, o1), _mm_unpacklo_epi32(e1, o1));
+            } else {
+                q2_1 = _mm256_set_epi32(iq3xxs_grid[q3[7]], iq3xxs_grid[q3[6]], iq3xxs_grid[q3[5]], iq3xxs_grid[q3[4]],
+                                        iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
+                q2_2 = _mm256_set_epi32(iq3xxs_grid[q3[7]], iq3xxs_grid[q3[6]], iq3xxs_grid[q3[5]], iq3xxs_grid[q3[4]],
+                                        iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
+                s2_1 = _mm256_set_epi64x(signs64[(aux32[0] >> 21) & 127], signs64[(aux32[0] >> 14) & 127],
+                                         signs64[(aux32[0] >>  7) & 127], signs64[(aux32[0] >>  0) & 127]);
+                s2_2 = _mm256_set_epi64x(signs64[(aux32[1] >> 21) & 127], signs64[(aux32[1] >> 14) & 127],
+                                         signs64[(aux32[1] >>  7) & 127], signs64[(aux32[1] >>  0) & 127]);
+            }
+            q3 += 16; gas += 8;
             const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
             const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
             const __m256i dot1  = _mm256_maddubs_epi16(q2_1, q8s_1);
@@ -3440,14 +3491,26 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             // At leat on my CPU (Ryzen 7950X), using _mm256_i32gather_epi32 is slower than _mm256_set_epi32. Strange.
             //const __m256i q2_1 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[0], 4);
             //const __m256i q2_2 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[1], 4);
-            const __m256i q2_1 = _mm256_set_epi32(
-                    iq3s_grid[idx.index[7]], iq3s_grid[idx.index[6]], iq3s_grid[idx.index[5]], iq3s_grid[idx.index[4]],
-                    iq3s_grid[idx.index[3]], iq3s_grid[idx.index[2]], iq3s_grid[idx.index[1]], iq3s_grid[idx.index[0]]
-            );
-            const __m256i q2_2 = _mm256_set_epi32(
-                    iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]], iq3s_grid[idx.index[12]],
-                    iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[ 9]], iq3s_grid[idx.index[ 8]]
-            );
+            // Bee: on Intel Raptor Lake (13700HX) vgather is 1.67x faster than scalar set_epi32 (bench-verified,
+            // bit-exact). Gate via BEELLAMA_CPU_FAST_IQ since the tradeoff is CPU-specific.
+            static int fast_gather = -1;
+            if (fast_gather < 0) {
+                fast_gather = getenv("BEELLAMA_CPU_FAST_IQ") != NULL;
+            }
+            __m256i q2_1, q2_2;
+            if (fast_gather) {
+                q2_1 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[0], 4);
+                q2_2 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[1], 4);
+            } else {
+                q2_1 = _mm256_set_epi32(
+                        iq3s_grid[idx.index[7]], iq3s_grid[idx.index[6]], iq3s_grid[idx.index[5]], iq3s_grid[idx.index[4]],
+                        iq3s_grid[idx.index[3]], iq3s_grid[idx.index[2]], iq3s_grid[idx.index[1]], iq3s_grid[idx.index[0]]
+                );
+                q2_2 = _mm256_set_epi32(
+                        iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]], iq3s_grid[idx.index[12]],
+                        iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[ 9]], iq3s_grid[idx.index[ 8]]
+                );
+            }
 
             __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
@@ -3620,10 +3683,21 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #ifdef __BMI2__
             const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib], 0x700070007000700ULL);
             const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 1], 0x700070007000700ULL);
-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
+            // Bee: env-gated vgather fast path (bit-exact; Raptor Lake where scalar LUT gathers bite)
+            static int fast_gather = -1;
+            if (fast_gather < 0) {
+                fast_gather = getenv("BEELLAMA_CPU_FAST_IQ") != NULL;
+            }
+            __m256i q1b_1, q1b_2;
+            if (fast_gather) {
+                q1b_1 = ggml_bee_gather_4x8b(iq1s_grid, _mm_cvtepu16_epi32(_mm_cvtsi64_si128((long long)packed_idx1)));
+                q1b_2 = ggml_bee_gather_4x8b(iq1s_grid, _mm_cvtepu16_epi32(_mm_cvtsi64_si128((long long)packed_idx2)));
+            } else {
+                const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+                const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+                q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+                q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
+            }
 #else
             const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[ib+0] >> 1) & 0x700)], iq1s_grid[qs[2] | ((qh[ib+0] << 2) & 0x700)],
                                                     iq1s_grid[qs[1] | ((qh[ib+0] << 5) & 0x700)], iq1s_grid[qs[0] | ((qh[ib+0] << 8) & 0x700)]);
