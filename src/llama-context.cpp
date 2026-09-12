@@ -866,8 +866,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     // context. The probe reserves a worst-case graph over the FULL memory module
     // (all trunk layers), which alone can exhaust the spare VRAM this mode is
     // trying to free up. The draft graph is tiny and needs no fused ops.
+    // Flash-attention support is kept as requested (auto resolves to "on"
+    // without the probe: the draft attention relies on FA and the probe's
+    // worst-case graph is exactly what this mode cannot afford).
     static const bool bee_mtp_skip_probe = getenv("BEELLAMA_MTP_CTX_CPU") != nullptr;
     if (bee_mtp_skip_probe && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.auto_fa = false;
         cparams.auto_fgdn = false;
         cparams.auto_flid = false;
         cparams.auto_fhc  = false;

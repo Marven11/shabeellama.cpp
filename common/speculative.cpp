@@ -1549,8 +1549,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // BEELLAMA_MTP_CTX_CPU in common_speculative_init_result), the
         // server-side batch can be much larger than the draft context capacity.
         // Slice the input into llama_n_batch(ctx_dft) chunks; pending_h chains
-        // across slices exactly like across calls, and verify_h keeps the
-        // original overwrite semantics (it is only consumed during decode).
+        // across slices exactly like across calls. Within one process() call
+        // the per-slice verify rows are APPENDED to verify_h, so accept() can
+        // index a sequence's rows globally even when its row range spans a
+        // slice boundary; across calls the rows are reset, matching the
+        // unchunked overwrite-per-call semantics.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            verify_h[seq_id].clear();
+            verify_h_rows[seq_id] = 0;
+        }
         const int32_t n_slice = (int32_t) llama_n_batch(this->params.ctx_dft);
         if (batch_in.n_tokens <= n_slice) {
             return process_batch(batch_in, 0, batch_in.n_tokens);
@@ -1658,16 +1665,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            const int32_t base   = verify_h_rows[seq_id];
+            verify_h_rows[seq_id] += n_rows;
+            verify_h[seq_id].resize((size_t) verify_h_rows[seq_id] * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, k0 + i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                std::memcpy(verify_h[seq_id].data() + (size_t) (base + i) * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (base + n_rows - 1) * n_embd, row_bytes);
         }
 
         return true;
@@ -2707,24 +2715,30 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        // Bee: optionally keep the embedded-MTP context's caches (rs/kv) on the host,
-        // so a large target model can fit the MTP head within limited VRAM.
-        // The nextn layer weights themselves are placed via tensor overrides (e.g. -ot "blk\.64\.=CPU").
+        // Bee: optionally keep the embedded-MTP context's caches on the host
+        // via tensor overrides (e.g. -ot "blk\.64\.=CPU"), so a large target
+        // model can fit the MTP head within limited VRAM.
+        // For MTP-on-hybrid architectures (Qwen3.5/Qwen3Next/Nemotron-H) the
+        // draft graph contains only the dense nextn attention layer, so there
+        // is no recurrent/rs cache to move; this gate's effects here are the
+        // batch clamps below and the fused-op probe skip. Hybrid archs with
+        // nextn that are NOT in the mtp_on_hybrid_* lists (e.g. DEEPSEEK4)
+        // additionally get the hybrid rs-cache placement override in
+        // llama_model::create_memory.
         if (getenv("BEELLAMA_MTP_CTX_CPU") != nullptr) {
-            // Bee: only the recurrent (GDN) state cache moves to host; the nextn
-            // attention KV stays on the GPU beside the nextn attention op, so
-            // draft attention never needs cross-backend KV copies.
-            // rs cache placement is decided in llama_model::create_memory
-            // (llama-memory-hybrid) under the same env gate.
-            //
             // the MTP context never needs more than (n_draft + 1) tokens per
             // decode step, and process() slices large server batches to fit;
             // clamping the batches keeps its compute-buffer reserve within
-            // limited VRAM headroom
-            cparams.n_batch  = std::min<uint32_t>(cparams.n_batch,  8);
+            // limited VRAM headroom. The floor of n_seq_max keeps one batch
+            // slot per sequence: every concurrently drafting sequence adds a
+            // row per draft step (common.cpp llama_batch_add would otherwise
+            // abort once capacity is exceeded, e.g. --parallel 9).
+            cparams.n_batch  = std::min<uint32_t>(cparams.n_batch,
+                    std::max<uint32_t>(8, cparams.n_seq_max));
             cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, 8);
             // fused-op probing is disabled separately in llama_context::resolve_fused_ops
-            LOG_INF("%s: BEELLAMA_MTP_CTX_CPU=1, MTP rs cache kept on host, batches clamped to 8\n", __func__);
+            LOG_INF("%s: BEELLAMA_MTP_CTX_CPU is set, MTP batches clamped to %u (floor n_seq_max = %u)\n",
+                    __func__, (int) cparams.n_batch, (int) cparams.n_seq_max);
         }
     }
 

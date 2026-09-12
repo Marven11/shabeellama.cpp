@@ -2229,14 +2229,17 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
-    // Bee (BEELLAMA_MTP_CTX_CPU): for the embedded-MTP context the recurrent
-    // (GDN) state cache is kept on the host while the attention KV stays on
-    // the GPU beside the nextn attention op, so draft attention never needs
-    // cross-backend KV copies.
+    // Bee (BEELLAMA_MTP_CTX_CPU): host-side cache placement override for the
+    // embedded-MTP context. For MTP-on-hybrid architectures the draft graph
+    // contains only the dense nextn attention layer, so this context has no
+    // recurrent (GDN) layers and the rs-cache override is vacuous there; it
+    // only matters for hybrid archs with nextn that are not in the
+    // mtp_on_hybrid_* lists (e.g. DEEPSEEK4), where it keeps the hybrid rs
+    // cache on the host while the attention KV stays on the GPU.
     const bool bee_mtp_rs_cpu = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
             getenv("BEELLAMA_MTP_CTX_CPU") != nullptr;
     const bool offload_recr = bee_mtp_rs_cpu ? false : cparams.offload_kqv;
-    if (getenv("BEELLAMA_MTP_CTX_CPU") != nullptr) {
+    if (bee_mtp_rs_cpu) {
         LLAMA_LOG_INFO("%s: bee_mtp_rs_cpu=%d ctx_type=%d offload_recr=%d offload_kqv=%d\n", __func__,
                 (int) bee_mtp_rs_cpu, (int) cparams.ctx_type, (int) offload_recr, (int) cparams.offload_kqv);
     }
@@ -2650,22 +2653,37 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     uint32_t       kv_size_cur  = cparams.n_ctx_seq;
                     uint32_t       n_swa_cur    = hparams.n_swa;
                     llama_swa_type swa_type_cur = hparams.swa_type;
+                    bool           kv_windowed  = false;
+                    bool           kv_window_req = false;
                     if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
                         const char * wenv = getenv("BEELLAMA_MTP_DRAFT_KV_W");
                         if (wenv && *wenv) {
-                            const uint32_t w = std::max((uint32_t) 256,
-                                    (uint32_t) strtoul(wenv, nullptr, 10));
-                            if (w > 0) {
-                                kv_size_cur  = GGML_PAD(w + cparams.n_ubatch, 256);
-                                n_swa_cur    = w;
+                            char * wend = nullptr;
+                            const long long wraw = strtoll(wenv, &wend, 10);
+                            if (wend == wenv || (wend && *wend != '\0') || wraw < 0) {
+                                LLAMA_LOG_WARN("%s: invalid BEELLAMA_MTP_DRAFT_KV_W value '%s', ignoring\n",
+                                        __func__, wenv);
+                            } else if (wraw == 0) {
+                                // explicit 0 = keep the full draft KV (disabled)
+                            } else {
+                                kv_window_req = true;
+                                const uint32_t w = (uint32_t) std::min<long long>(wraw,
+                                        (long long) cparams.n_ctx_seq);
+                                const uint32_t wclamp = std::max<uint32_t>(256, w);
+                                kv_size_cur  = GGML_PAD(wclamp + cparams.n_ubatch, 256);
+                                n_swa_cur    = wclamp;
                                 swa_type_cur = LLAMA_SWA_TYPE_STANDARD;
+                                kv_windowed  = true;
                                 LLAMA_LOG_INFO("%s: Bee MTP draft KV windowed: n_swa = %u, kv_size = %u (was %u)\n",
-                                        __func__, w, kv_size_cur, cparams.n_ctx_seq);
+                                        __func__, wclamp, kv_size_cur, cparams.n_ctx_seq);
                             }
                         }
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        if (kv_window_req) {
+                            LLAMA_LOG_WARN("%s: BEELLAMA_MTP_DRAFT_KV_W ignored: the iswa cache branch does not consume a custom draft window\n", __func__);
+                        }
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2737,6 +2755,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         GGML_ASSERT(!hparams.is_swa_any());
 
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                            if (kv_window_req) {
+                                LLAMA_LOG_WARN("%s: BEELLAMA_MTP_DRAFT_KV_W ignored: kvarn caches do not consume a custom draft window\n", __func__);
+                            }
                             if (params.kv_tail_native_exact) {
                                 res = new llama_kv_cache(
                                         *this, hparams, kvarn_tail_type, kvarn_tail_type,
