@@ -48,7 +48,9 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      uint32_t   tail_tokens_swa_requested = UINT32_MAX,
                      uint32_t   tail_rollback_tokens = 0,
-                         bool   tail_native_exact_swa = false);
+                         bool   tail_native_exact_swa = false,
+                            /* Bee: optional separate offload for the recurrent cache (-1 = follow offload) */
+                         int   offload_recr = -1);
 
     ~llama_memory_hybrid_iswa() = default;
 

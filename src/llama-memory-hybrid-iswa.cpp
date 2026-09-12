@@ -39,7 +39,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t tail_tokens_requested,
                  uint32_t tail_tokens_swa_requested,
                  uint32_t tail_rollback_tokens,
-                     bool tail_native_exact_swa) :
+                     bool tail_native_exact_swa,
+                         int offload_recr) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -73,7 +74,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         model,
         type_r,
         type_s,
-        offload,
+        offload_recr < 0 ? offload : (offload_recr != 0),
         rs_size,
         n_seq_max,
         n_rs_seq,

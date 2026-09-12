@@ -1545,17 +1545,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        const int32_t n_tokens = batch_in.n_tokens;
+        // Bee: when the MTP context runs with a reduced n_batch (see
+        // BEELLAMA_MTP_CTX_CPU in common_speculative_init_result), the
+        // server-side batch can be much larger than the draft context capacity.
+        // Slice the input into llama_n_batch(ctx_dft) chunks; pending_h chains
+        // across slices exactly like across calls, and verify_h keeps the
+        // original overwrite semantics (it is only consumed during decode).
+        const int32_t n_slice = (int32_t) llama_n_batch(this->params.ctx_dft);
+        if (batch_in.n_tokens <= n_slice) {
+            return process_batch(batch_in, 0, batch_in.n_tokens);
+        }
+        for (int32_t k0 = 0; k0 < batch_in.n_tokens; k0 += n_slice) {
+            const int32_t k1 = std::min(batch_in.n_tokens, k0 + n_slice);
+            if (!process_batch(batch_in, k0, k1)) {
+                return false;
+            }
+        }
+        return true;
+    }
 
-        // remember the frist and last batch index for each sequence
+    bool process_batch(const llama_batch & batch_in, int32_t k0, int32_t k1) {
+        const int32_t n_tokens = k1 - k0;
+
+        // remember the frist and last batch index for each sequence (slice-local)
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
         for (int k = 0; k < n_tokens; ++k) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+                GGML_ASSERT(batch_in.n_seq_id[k0 + k] == 1);
 
-                if (batch_in.seq_id[k][0] == seq_id) {
+                if (batch_in.seq_id[k0 + k][0] == seq_id) {
                     i_batch_end[seq_id] = k;
                     if (i_batch_beg[seq_id] < 0) {
                         i_batch_beg[seq_id] = k;
@@ -1574,7 +1594,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                common_batch_add(batch, batch_in.token[k0 + k], batch_in.pos[k0 + k], { batch_in.seq_id[k0 + k][0] }, 0);
             }
 
             // shift the tgt embeddings to the right by one position
@@ -1584,10 +1604,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt + (size_t) k0 * n_embd, row_bytes * (n_tokens-1));
             }
 
-            // fill the pending embeddings from a previous run
+            // fill the pending embeddings from a previous run (or slice)
             auto set_h = [&](int idx, const float * h_row) {
                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
             };
@@ -1610,7 +1630,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         if (i_batch_beg[seq_id] < 0) {
                             continue;
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[k0 + i_batch_beg[seq_id]], -1);
                     }
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
@@ -1618,7 +1638,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
+                            head, (int) rc, (int) batch_in.pos[k0]);
                     ok = false;
                     break;
                 }
@@ -1642,7 +1662,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, k0 + i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -2687,6 +2707,25 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // Bee: optionally keep the embedded-MTP context's caches (rs/kv) on the host,
+        // so a large target model can fit the MTP head within limited VRAM.
+        // The nextn layer weights themselves are placed via tensor overrides (e.g. -ot "blk\.64\.=CPU").
+        if (getenv("BEELLAMA_MTP_CTX_CPU") != nullptr) {
+            // Bee: only the recurrent (GDN) state cache moves to host; the nextn
+            // attention KV stays on the GPU beside the nextn attention op, so
+            // draft attention never needs cross-backend KV copies.
+            // rs cache placement is decided in llama_model::create_memory
+            // (llama-memory-hybrid) under the same env gate.
+            //
+            // the MTP context never needs more than (n_draft + 1) tokens per
+            // decode step, and process() slices large server batches to fit;
+            // clamping the batches keeps its compute-buffer reserve within
+            // limited VRAM headroom
+            cparams.n_batch  = std::min<uint32_t>(cparams.n_batch,  8);
+            cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, 8);
+            // fused-op probing is disabled separately in llama_context::resolve_fused_ops
+            LOG_INF("%s: BEELLAMA_MTP_CTX_CPU=1, MTP rs cache kept on host, batches clamped to 8\n", __func__);
+        }
     }
 
     // the draft context holds as many tokens per sequence as the target context

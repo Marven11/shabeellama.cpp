@@ -34,7 +34,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
-                 uint32_t   tail_rollback_tokens) :
+                 uint32_t   tail_rollback_tokens,
+                         int   offload_recr) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -66,7 +67,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         model,
         type_r,
         type_s,
-        offload,
+        offload_recr < 0 ? offload : (offload_recr != 0),
         rs_size,
         n_seq_max,
         n_rs_seq,

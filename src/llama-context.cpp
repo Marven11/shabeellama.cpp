@@ -861,6 +861,25 @@ llama_context::~llama_context() {
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
+
+    // Bee (BEELLAMA_MTP_CTX_CPU): skip fused-op probing for the embedded-MTP
+    // context. The probe reserves a worst-case graph over the FULL memory module
+    // (all trunk layers), which alone can exhaust the spare VRAM this mode is
+    // trying to free up. The draft graph is tiny and needs no fused ops.
+    static const bool bee_mtp_skip_probe = getenv("BEELLAMA_MTP_CTX_CPU") != nullptr;
+    if (bee_mtp_skip_probe && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.auto_fgdn = false;
+        cparams.auto_flid = false;
+        cparams.auto_fhc  = false;
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = false;
+        cparams.fused_lid    = false;
+        cparams.fused_dsv4_hc_pre  = false;
+        cparams.fused_dsv4_hc_comb = false;
+        cparams.fused_dsv4_hc_post = false;
+        LLAMA_LOG_INFO("%s: BEELLAMA_MTP_CTX_CPU=1, fused-op probing disabled for the MTP context\n", func);
+        return;
+    }
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
         if (!enabled) {
             return;

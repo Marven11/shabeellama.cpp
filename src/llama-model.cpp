@@ -2229,6 +2229,17 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    // Bee (BEELLAMA_MTP_CTX_CPU): for the embedded-MTP context the recurrent
+    // (GDN) state cache is kept on the host while the attention KV stays on
+    // the GPU beside the nextn attention op, so draft attention never needs
+    // cross-backend KV copies.
+    const bool bee_mtp_rs_cpu = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            getenv("BEELLAMA_MTP_CTX_CPU") != nullptr;
+    const bool offload_recr = bee_mtp_rs_cpu ? false : cparams.offload_kqv;
+    if (getenv("BEELLAMA_MTP_CTX_CPU") != nullptr) {
+        LLAMA_LOG_INFO("%s: bee_mtp_rs_cpu=%d ctx_type=%d offload_recr=%d offload_kqv=%d\n", __func__,
+                (int) bee_mtp_rs_cpu, (int) cparams.ctx_type, (int) offload_recr, (int) cparams.offload_kqv);
+    }
     llama_memory_i * res;
     const ggml_type kvarn_tail_type = params.kv_tail_type == GGML_TYPE_COUNT ?
             GGML_TYPE_F16 : params.kv_tail_type;
@@ -2539,7 +2550,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* tail requested    */ params.kv_tail_tokens_requested,
                             /* SWA requested     */ params.kv_tail_tokens_swa_requested,
                             /* rollback reserve  */ params.kv_tail_rollback_tokens,
-                            /* SWA native exact  */ params.kv_tail_native_exact_swa);
+                            /* SWA native exact  */ params.kv_tail_native_exact_swa,
+                            /* Bee: rs cache offload override */ bee_mtp_rs_cpu ? 0 : -1);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             std::unique_ptr<llama_memory_i> mem_attn;
@@ -2565,7 +2577,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     *this,
                                     GGML_TYPE_F32,
                                     GGML_TYPE_F32,
-                                    cparams.offload_kqv,
+                                    offload_recr,
                                     std::max((uint32_t) 1, cparams.n_seq_max),
                                     cparams.n_seq_max,
                                     cparams.n_rs_seq,
@@ -2594,7 +2606,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* tail_tokens       */ params.kv_tail_tokens,
                                 /* tail_type         */ params.kv_tail_type,
                                 /* tail requested    */ params.kv_tail_tokens_requested,
-                                /* rollback reserve  */ params.kv_tail_rollback_tokens);
+                                /* rollback reserve  */ params.kv_tail_rollback_tokens,
+                                /* Bee: rs cache offload override */ bee_mtp_rs_cpu ? 0 : -1);
                         }
                     }
                 } else {
