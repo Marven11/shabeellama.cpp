@@ -161,6 +161,29 @@
 
                 mpi-cpu = config.packages.default.override { useMpi = true; };
                 mpi-cuda = config.packages.default.override { useMpi = true; };
+
+                # Bee: beellama.cpp — the deployment variant for the system
+                # llama-server. Same CUDA instance as `.#cuda` (deps closure is
+                # shared), plus the build flags that are easy to get silently
+                # wrong under nix:
+                #   * Explicit CPU SIMD: nix strips -march=native, so without
+                #     these the CPU backend compiles to baseline C kernels and
+                #     CPU-side FFN work (Bee MTP 5-layer trunk offload) runs
+                #     ~3x slower. Verified: 31.85 vs 9.15-11.2 t/s @72k.
+                #   * GGML_CUDA_FA_ALL_QUANTS=ON: full FA quant matrix, keeps
+                #     kvarn fast-decode pairs available.
+                beellama = config.legacyPackages.llamaPackagesCuda.llama-cpp.overrideAttrs (old: {
+                  pname = "beellama.cpp";
+                  version = "0.4.4-mtp-min.${self.shortRev or self.dirtyShortRev or "dirty"}";
+                  cmakeFlags = (old.cmakeFlags or []) ++ [
+                    (lib.cmakeBool "GGML_CUDA_FA_ALL_QUANTS" true)
+                    (lib.cmakeBool "GGML_AVX" true)
+                    (lib.cmakeBool "GGML_AVX2" true)
+                    (lib.cmakeBool "GGML_F16C" true)
+                    (lib.cmakeBool "GGML_FMA" true)
+                    (lib.cmakeBool "GGML_SSE42" true)
+                  ];
+                });
               }
               // lib.optionalAttrs (system == "x86_64-linux") {
                 rocm = config.legacyPackages.llamaPackagesRocm.llama-cpp;
