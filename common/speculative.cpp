@@ -1562,9 +1562,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (batch_in.n_tokens <= n_slice) {
             return process_batch(batch_in, 0, batch_in.n_tokens);
         }
+        // snapshot pending_h so a mid-slice failure can roll back: pending_h
+        // must track the server's token stream, and a discarded slice k would
+        // otherwise leave it ahead of the tokens actually committed to the
+        // context (verify_h needs no rollback; the next process() clears it).
+        auto pending_h_before_slices = pending_h;
         for (int32_t k0 = 0; k0 < batch_in.n_tokens; k0 += n_slice) {
             const int32_t k1 = std::min(batch_in.n_tokens, k0 + n_slice);
             if (!process_batch(batch_in, k0, k1)) {
+                pending_h = pending_h_before_slices;
                 return false;
             }
         }
@@ -2725,20 +2731,30 @@ common_speculative_init_result::common_speculative_init_result(
         // nextn that are NOT in the mtp_on_hybrid_* lists (e.g. DEEPSEEK4)
         // additionally get the hybrid rs-cache placement override in
         // llama_model::create_memory.
-        if (getenv("BEELLAMA_MTP_CTX_CPU") != nullptr) {
+        // Bee: value-based gate, matching BEELLAMA_MTP_DRAFT_KV_W semantics
+        // and the documented contract: any non-zero value enables, 0 disables.
+        const char * bee_cpu_env = getenv("BEELLAMA_MTP_CTX_CPU");
+        const bool bee_mtp_ctx_cpu = bee_cpu_env != nullptr &&
+                strtoll(bee_cpu_env, nullptr, 10) != 0;
+        if (bee_mtp_ctx_cpu) {
             // the MTP context never needs more than (n_draft + 1) tokens per
-            // decode step, and process() slices large server batches to fit;
-            // clamping the batches keeps its compute-buffer reserve within
-            // limited VRAM headroom. The floor of n_seq_max keeps one batch
-            // slot per sequence: every concurrently drafting sequence adds a
-            // row per draft step (common.cpp llama_batch_add would otherwise
-            // abort once capacity is exceeded, e.g. --parallel 9).
-            cparams.n_batch  = std::min<uint32_t>(cparams.n_batch,
-                    std::max<uint32_t>(8, cparams.n_seq_max));
-            cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, 8);
+            // decode step per sequence, and process() slices large server batches
+            // to fit; clamping the batches keeps its compute-buffer reserve within
+            // limited VRAM headroom. The floor keeps one row per sequence per
+            // draft step: chain-head drafting re-adds the whole prefix
+            // (id_last + drafted-so-far) for every still-drafting sequence at
+            // each step, so the worst case is n_seq_max * (n_draft + 1) rows
+            // (common.cpp llama_batch_add would otherwise abort once capacity
+            // is exceeded, e.g. --parallel 2 with n-max 4 under this clamp).
+            const uint32_t floor_rows = std::max<uint32_t>(8,
+                    cparams.n_seq_max * (uint32_t)(params.speculative.draft.n_max + 1));
+            cparams.n_batch  = std::min<uint32_t>(cparams.n_batch,  floor_rows);
+            cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, floor_rows);
             // fused-op probing is disabled separately in llama_context::resolve_fused_ops
-            LOG_INF("%s: BEELLAMA_MTP_CTX_CPU is set, MTP batches clamped to %u (floor n_seq_max = %u)\n",
-                    __func__, (int) cparams.n_batch, (int) cparams.n_seq_max);
+            LOG_INF("%s: BEELLAMA_MTP_CTX_CPU is enabled, MTP batches clamped to %u "
+                    "(floor rows = %u = n_seq_max %u x (n_draft %d + 1))\n",
+                    __func__, (int) cparams.n_batch, (int) floor_rows,
+                    (int) cparams.n_seq_max, params.speculative.draft.n_max);
         }
     }
 

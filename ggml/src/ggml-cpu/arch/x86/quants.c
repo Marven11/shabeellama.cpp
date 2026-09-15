@@ -2867,7 +2867,9 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             // Bee: env-gated vgather fast path (bit-exact; Raptor Lake where scalar LUT gathers bite)
             static int fast_gather = -1;
             if (fast_gather < 0) {
-                fast_gather = getenv("BEELLAMA_CPU_FAST_IQ") != NULL;
+                // value-based gate: any non-zero value enables, 0 disables
+                const char * fast_iq_env = getenv("BEELLAMA_CPU_FAST_IQ");
+                fast_gather = fast_iq_env != NULL && strtoll(fast_iq_env, NULL, 10) != 0;
             }
             __m256i q2_1, q2_2, q2_3, q2_4;
             if (fast_gather) {
@@ -3317,7 +3319,9 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
             // set_epi32 LUT gathers are the bottleneck). Tradeoff is CPU-specific, hence the gate.
             static int fast_gather = -1;
             if (fast_gather < 0) {
-                fast_gather = getenv("BEELLAMA_CPU_FAST_IQ") != NULL;
+                // value-based gate: any non-zero value enables, 0 disables
+                const char * fast_iq_env = getenv("BEELLAMA_CPU_FAST_IQ");
+                fast_gather = fast_iq_env != NULL && strtoll(fast_iq_env, NULL, 10) != 0;
             }
             memcpy(aux32, gas, 8);
             __m256i q2_1, q2_2, s2_1, s2_2;

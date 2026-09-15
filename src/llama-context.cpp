@@ -869,7 +869,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     // Flash-attention support is kept as requested (auto resolves to "on"
     // without the probe: the draft attention relies on FA and the probe's
     // worst-case graph is exactly what this mode cannot afford).
-    static const bool bee_mtp_skip_probe = getenv("BEELLAMA_MTP_CTX_CPU") != nullptr;
+    static const bool bee_mtp_skip_probe = []() {
+        // value-based gate: any non-zero value enables, 0 disables (matches
+        // the documented contract and BEELLAMA_MTP_DRAFT_KV_W semantics)
+        const char * e = getenv("BEELLAMA_MTP_CTX_CPU");
+        return e != nullptr && strtoll(e, nullptr, 10) != 0;
+    }();
     if (bee_mtp_skip_probe && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         cparams.auto_fa = false;
         cparams.auto_fgdn = false;
@@ -881,7 +886,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_dsv4_hc_pre  = false;
         cparams.fused_dsv4_hc_comb = false;
         cparams.fused_dsv4_hc_post = false;
-        LLAMA_LOG_INFO("%s: BEELLAMA_MTP_CTX_CPU=1, fused-op probing disabled for the MTP context\n", func);
+        LLAMA_LOG_INFO("%s: BEELLAMA_MTP_CTX_CPU is enabled, fused-op probing disabled for the MTP context\n", func);
         return;
     }
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {

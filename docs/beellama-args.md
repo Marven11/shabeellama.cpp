@@ -267,13 +267,13 @@ All Bee environment gates are default-off; unset means stock behavior.
 
 | Variable | Effect |
 |---|---|
-| `BEELLAMA_MTP_CTX_CPU` | Run the embedded-MTP draft head with its FFN/embed tensors placed on the host via tensor overrides (e.g. `-ot 'blk\.64\.(ffn_|nextn)=CPU'`). Clamps the draft context `n_batch`/`n_ubatch` (floor `n_seq_max`), slices large server batches inside `process()`, and skips the fused-op graph probe for the MTP context. For hybrid archs with nextn outside the MTP-on-hybrid lists (e.g. DEEPSEEK4) it additionally places the hybrid recurrent state cache on the host. Any non-zero value enables; `0` disables. |
+| `BEELLAMA_MTP_CTX_CPU` | Run the embedded-MTP draft head with its FFN/embed tensors placed on the host via tensor overrides (e.g. `-ot 'blk\.64\.(ffn_|nextn)=CPU'`). Clamps the draft context `n_batch`/`n_ubatch` (floor `n_seq_max` x (`n_draft` + 1), covering the chain-head drafting path), slices large server batches inside `process()`, and skips the fused-op graph probe for the MTP context (which requires the target device to support flash attention, since the probe is skipped). For hybrid archs with nextn that construct their memory through the hybrid path (arch-specific fast paths such as DEEPSEEK4 do not reach it) it additionally places the hybrid recurrent state cache on the host. Any non-zero value enables; `0` disables. |
 | `BEELLAMA_MTP_DRAFT_KV_W` | With `BEELLAMA_MTP_CTX_CPU`, turn the draft head's attention KV into a sliding-window ring of the last `W` positions (clamped to `max(256, W)`, capped at the context size; `0` disables). Reduces draft KV from O(n_ctx) to O(W); acceptance-only impact (drafts are verified). Consumed by the plain KV-cache branch of MTP-on-hybrid models; a warning is logged when the iswa/kvarn branches cannot honor it. |
 | `BEELLAMA_FFN_TP_CPU` | TP-FFN neuron-split tensor parallel: number of FFN neurons (rows, 256-aligned) per trunk layer computed on the CPU. |
 | `BEELLAMA_FFN_TP_LAYERS` | Limit the TP-FFN neuron split to the first K trunk layers (default: all). |
 | `BEELLAMA_FFN_TP_WHERE` | Set to `attn` to compute the CPU split only on full-attention layers. |
 | `GGML_SCHED_TP_OVERLAP` | Enables the TP-FFN async overlap path in the scheduler (skip pre-split event waits, stream-ordered host/device copies). |
-| `BEELLAMA_CPU_FAST_IQ` | Enables the x86 vgather fast dequant path for IQ quant dot products. |
+| `BEELLAMA_CPU_FAST_IQ` | Enables the x86 vgather fast dequant path for IQ quant dot products. Any non-zero value enables; `0` disables. |
 
 ## Migration from earlier versions
 

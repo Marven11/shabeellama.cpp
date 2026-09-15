@@ -2234,10 +2234,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // contains only the dense nextn attention layer, so this context has no
     // recurrent (GDN) layers and the rs-cache override is vacuous there; it
     // only matters for hybrid archs with nextn that are not in the
-    // mtp_on_hybrid_* lists (e.g. DEEPSEEK4), where it keeps the hybrid rs
-    // cache on the host while the attention KV stays on the GPU.
+    // mtp_on_hybrid_* lists and that construct their memory through this
+    // hybrid path (arch-specific fast paths, e.g. DEEPSEEK4, never reach it).
+    // Value-based gate: any non-zero value enables, 0 disables.
+    const char * bee_cpu_env = getenv("BEELLAMA_MTP_CTX_CPU");
     const bool bee_mtp_rs_cpu = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-            getenv("BEELLAMA_MTP_CTX_CPU") != nullptr;
+            bee_cpu_env != nullptr && strtoll(bee_cpu_env, nullptr, 10) != 0;
     const bool offload_recr = bee_mtp_rs_cpu ? false : cparams.offload_kqv;
     if (bee_mtp_rs_cpu) {
         LLAMA_LOG_INFO("%s: bee_mtp_rs_cpu=%d ctx_type=%d offload_recr=%d offload_kqv=%d\n", __func__,
