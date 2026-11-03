@@ -172,6 +172,16 @@
                 #     ~3x slower. Verified: 31.85 vs 9.15-11.2 t/s @72k.
                 #   * GGML_CUDA_FA_ALL_QUANTS=ON: full FA quant matrix, keeps
                 #     kvarn fast-decode pairs available.
+                #   * CMAKE_CUDA_ARCHITECTURES=89-real: the deployment GPU is an
+                #     RTX 4080 Laptop (sm_89). ggml's default list (75v / 80v / 86 /
+                #     89 / 90v / 120a / 121a) together with FA_ALL_QUANTS made
+                #     libggml-cuda.so ~2 GiB, which no longer links on x86-64
+                #     ("relocation truncated to fit: R_X86_64_PC32" plus
+                #     "PC-relative offset overflow in PLT entry"), and every build
+                #     took ~13 h. Building only the deployment arch fixes the link
+                #     and cuts the build well under an hour. For a different card
+                #     override this flag (`overrideAttrs (o: { cmakeFlags = ...; })`);
+                #     targeting several arches at once reintroduces both problems.
                 beellama = config.legacyPackages.llamaPackagesCuda.llama-cpp.overrideAttrs (old: {
                   pname = "beellama.cpp";
                   version = "0.4.4-mtp-min.${self.shortRev or self.dirtyShortRev or "dirty"}";
@@ -182,6 +192,7 @@
                     (lib.cmakeBool "GGML_F16C" true)
                     (lib.cmakeBool "GGML_FMA" true)
                     (lib.cmakeBool "GGML_SSE42" true)
+                    "-DCMAKE_CUDA_ARCHITECTURES=89-real"
                   ];
                 });
               }
